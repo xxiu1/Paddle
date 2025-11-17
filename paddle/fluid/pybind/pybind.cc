@@ -85,6 +85,7 @@ limitations under the License. */
 #include "paddle/phi/common/bfloat16.h"
 #include "paddle/phi/common/float16.h"
 #include "paddle/phi/common/int_array.h"
+#include "paddle/phi/common/logging_utils.h"
 #include "paddle/phi/core/framework/reader.h"
 #include "paddle/phi/core/memory/allocation/allocator_strategy.h"
 #include "paddle/phi/core/raw_tensor.h"
@@ -179,6 +180,7 @@ limitations under the License. */
 #endif
 
 #ifdef PADDLE_WITH_XPU
+#include "paddle/phi/core/memory/allocation/xpu_ipc_allocator.h"
 #include "paddle/phi/core/platform/device/xpu/xpu_info.h"
 #include "paddle/phi/core/platform/device/xpu/xpu_op_list.h"
 #endif
@@ -495,6 +497,15 @@ struct iinfo {
       case phi::DataType::UINT8:
         CASE_IINFO_BODY(uint8, uint8_t);
         break;
+      case phi::DataType::UINT16:
+        CASE_IINFO_BODY(uint16, uint16_t);
+        break;
+      case phi::DataType::UINT32:
+        CASE_IINFO_BODY(uint32, uint32_t);
+        break;
+      case phi::DataType::UINT64:
+        CASE_IINFO_BODY(uint64, uint64_t);
+        break;
       case phi::DataType::INT8:
         CASE_IINFO_BODY(int8, int8_t);
         break;
@@ -770,7 +781,7 @@ int DLPackDLTensorFromPyObjectNoSync(void *py_obj, DLTensor *out) {
     paddle::Tensor tensor = handle.cast<paddle::Tensor>();
     std::shared_ptr<phi::DenseTensor> dense_tensor =
         std::static_pointer_cast<phi::DenseTensor>(tensor.impl());
-    paddle::framework::ToDLPackNonOwningImpl(*dense_tensor, *out);
+    paddle::framework::ToDLPackNonOwningImpl(*dense_tensor, out);
     return 0;
   } catch (const std::exception &e) {
     PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -1215,6 +1226,16 @@ struct MmapStorage {
           size_ / 1073741824));
     }
 #endif
+  }
+  ~MmapStorage() {
+    if (base_ptr_) {
+#if defined(WIN32) || defined(_WIN32) || defined(WIN64) || defined(_WIN6)
+      UnmapViewOfFile(base_ptr_);
+#else
+      munmap(base_ptr_, size);
+#endif
+      base_ptr_ = nullptr;
+    }
   }
   void *base_ptr_;
   int64_t size;
@@ -1683,6 +1704,21 @@ PYBIND11_MODULE(libpaddle, m) {
           }
         });
 
+  m.def("_ipc_collect", []() {
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_XPU)
+#if defined(_WIN32)
+    PADDLE_THROW(common::errors::Unavailable(
+        "ipc_collect is not supported on Windows (CUDA/XPU IPC)."));
+#else
+      paddle::memory::allocation::IpcCollect();
+#endif
+#else
+      PADDLE_THROW(common::errors::Unavailable(
+        "Paddle is not compiled with CUDA/XPU, "
+        "so `ipc_collect` cannot be used."));
+#endif
+  });
+
   class NodePostHookRemoveHelper {
    public:
     NodePostHookRemoveHelper(std::shared_ptr<egr::GradNodeBase> node,
@@ -1779,14 +1815,17 @@ PYBIND11_MODULE(libpaddle, m) {
   m.def("wait_device", [](const phi::Place &place) {
     phi::DeviceContextPool::Instance().Get(place)->Wait();
   });
-  py::class_<MmapStorage>(m, "MmapStorage")  // class attr: base_ptr_, size_
+  py::class_<MmapStorage, std::shared_ptr<MmapStorage>>(
+      m, "MmapStorage")  // class attr: base_ptr_, size_
       .def(py::init<const std::string &, int64_t>())  // filename_, nbytes
       .def("get_slice",
-           [](MmapStorage &self,
+           [](py::object self_obj,
               proto::VarType::Type dtype,
               int64_t start,
               int64_t stop,
               int64_t step) {
+             auto self_sp = py::cast<std::shared_ptr<MmapStorage>>(self_obj);
+             MmapStorage &self = *self_sp;
              if (stop < 0) {
                stop = start + 1;  // default: get the start element.
              }
@@ -1798,11 +1837,17 @@ PYBIND11_MODULE(libpaddle, m) {
                  PySlice_AdjustIndices(size_py, &start_py, &stop_py, step_py);
              auto data = static_cast<uint8_t *>(self.base_ptr_) + start;
              auto dtype_phi = phi::TransToPhiDataType(dtype);
-             return from_blob(data,
-                              phi::IntArray({slicelength}),
-                              dtype_phi,
-                              phi::DataLayout::NCHW,
-                              phi::CPUPlace());
+             return from_blob(
+                 reinterpret_cast<void *>(data),
+                 phi::IntArray({slicelength}),
+                 dtype_phi,
+                 phi::DataLayout::NCHW,
+                 phi::CPUPlace(),
+                 [self_sp = std::move(self_sp)](
+                     void *) mutable {  // NOLINT(readability/casting)
+                   pybind11::gil_scoped_acquire gil;
+                   self_sp.reset();
+                 });
            });
   m.def(
       "frombuffer",
@@ -3312,6 +3357,7 @@ All parameter, weight, gradient are variables in Paddle.
           // It may cause configuration effects for a single module
           VLOG(3) << "Set the VLOG level of all modules to " << level;
           FLAGS_v = level;
+          phi::set_phi_vlog_level(level);
         } else if (py::isinstance<py::dict>(module_levels)) {
           auto module_levels_dict = module_levels.cast<py::dict>();
           for (auto &item : module_levels_dict) {
@@ -3320,8 +3366,10 @@ All parameter, weight, gradient are variables in Paddle.
             if (module_name == "*") {
               VLOG(3) << "Set the VLOG level of all modules to " << level;
               FLAGS_v = level;
+              phi::set_phi_vlog_level(level);
             } else {
               google::SetVLOGLevel(module_name.c_str(), level);
+              phi::set_phi_vlog_level(module_name.c_str(), level);
             }
           }
         } else {
@@ -3573,6 +3621,7 @@ All parameter, weight, gradient are variables in Paddle.
     }
     platform::EmptyCache();
   });
+  m.def("vmm_compact", [] { platform::VmmCompact(); });
   m.def(
       "get_device_properties",
       [](int id) -> const gpuDeviceProp & {
@@ -4199,7 +4248,12 @@ All parameter, weight, gradient are variables in Paddle.
       .value("FLOAT8_E5M2", phi::DataType::FLOAT8_E5M2)
       .value("PSTRING", phi::DataType::PSTRING)
       .value("ALL_DTYPE", phi::DataType::ALL_DTYPE)
-      .export_values();
+      .export_values()
+      .def("__dlpack_data_type__", [](const phi::DataType &self) {
+        ::DLDataType dl_dtype =
+            paddle::framework::PhiDataTypeToDLDataType(self);
+        return py::make_tuple(dl_dtype.code, dl_dtype.bits, dl_dtype.lanes);
+      });
 
   py::class_<paddle::platform::EngineParams> engine_params(m,
                                                            "TRTEngineParams");
